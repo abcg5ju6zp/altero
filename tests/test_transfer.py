@@ -11,9 +11,12 @@ full and compare. A table added to the schema and forgotten here shows up as a
 difference rather than as silence.
 """
 
+import asyncio
 import errno
+import json
 import zipfile
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +25,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altero.db import Database
-from altero.errors import InvalidInputError, NotFoundError
+from altero.errors import (
+    AttachmentChangedError,
+    AttachmentMissingError,
+    ExportConflictError,
+    ExportPublishError,
+    ExportWriteError,
+    InvalidInputError,
+    NotFoundError,
+)
 from altero.models import (
     Collection,
     CollectionItem,
@@ -416,6 +427,691 @@ class TestRestoringFiles:
         await transfer.import_library(target_session, archive=tampered, storage_root=target_storage)
 
         assert storage.file_path(target_storage, digest).read_bytes() == b"something else"
+
+
+class TestSnapshotConsistency:
+    """Everything in an export comes from one library snapshot."""
+
+    async def test_a_commit_after_the_boundary_does_not_enter_the_snapshot(
+        self,
+        session: AsyncSession,
+        app: Any,
+        tmp_path: Path,
+    ) -> None:
+        # Setup happens, and is committed, before the export boundary starts.
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await make_item(session, library, key="OLD00001", fields={"title": "Before"})
+        await session.commit()
+
+        snapshot_connection = await transfer._begin_snapshot(session)
+        try:
+            boundary = await transfer._resolve(session, LibraryType.USER, 1)
+
+            # A different session writes and commits after the snapshot began.
+            async with app.state.database.session_factory() as writer:
+                written = await writer.get(Library, library.id)
+                written.version = library.version + 1
+                await make_item(writer, written, key="NEW00001", fields={"title": "After"})
+                await writer.commit()
+
+            snap = await transfer._collect_snapshot(session, boundary)
+
+            assert [item.key for item in snap.items] == ["OLD00001"]
+            assert snap.library.version == library.version
+            # The write really landed; the export simply predates it.
+            async with app.state.database.session_factory() as reader:
+                later = await reader.scalar(select(Item).where(Item.key == "NEW00001"))
+            assert later is not None
+        finally:
+            await transfer._end_snapshot(session, snapshot_connection)
+
+    async def test_export_reads_the_old_snapshot_while_a_write_commits(
+        self,
+        session: AsyncSession,
+        app: Any,
+        tmp_path: Path,
+    ) -> None:
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await make_item(session, library, key="OLD00001", fields={"title": "Before"})
+        await session.commit()
+        boundary_version = library.version
+
+        # Hold the export open, one statement after the library was resolved,
+        # while another session commits a write.
+        barrier: asyncio.Event = asyncio.Event()
+        proceed: asyncio.Event = asyncio.Event()
+        statements = 0
+        original_execute = session.execute
+
+        async def pausing_execute(statement: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal statements
+            result = await original_execute(statement, *args, **kwargs)
+            statements += 1
+            if statements == 1:
+                barrier.set()
+                await proceed.wait()
+            return result
+
+        async def mutate_after_boundary() -> None:
+            await barrier.wait()
+            async with app.state.database.session_factory() as writer:
+                written = await writer.get(Library, library.id)
+                written.version = boundary_version + 1
+                await make_item(
+                    writer, written, key="NEW00001", fields={"title": "After"}
+                )
+                await writer.commit()
+            proceed.set()
+
+        session.execute = pausing_execute  # type: ignore[method-assign]
+        archived, _ = await asyncio.gather(
+            transfer.export_library(
+                session,
+                library_type=LibraryType.USER,
+                owner_id=1,
+                storage_root=tmp_path / "storage",
+                destination=tmp_path / "library.zip",
+            ),
+            mutate_after_boundary(),
+        )
+
+        with zipfile.ZipFile(archived) as bundle:
+            manifest = json.loads(bundle.read("manifest.json"))
+            items = json.loads(bundle.read("items.json"))
+
+        assert manifest["library"]["version"] == boundary_version
+        assert [item["key"] for item in items] == ["OLD00001"]
+
+    async def test_a_serialization_failure_aborts_the_export(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from sqlalchemy.exc import DBAPIError
+
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await make_item(session, library, key="OLD00001", fields={"title": "Before"})
+        await session.commit()
+
+        class OriginalError(Exception):
+            sqlstate = "40001"
+
+        statements = 0
+        original_execute = session.execute
+
+        async def failing_execute(statement: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal statements
+            statements += 1
+            if statements >= 2:
+                raise DBAPIError("select 1", {}, OriginalError("boom"))
+            return await original_execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(session, "execute", failing_execute)
+
+        with pytest.raises(ExportConflictError):
+            await transfer.export_library(
+                session,
+                library_type=LibraryType.USER,
+                owner_id=1,
+                storage_root=tmp_path / "storage",
+                destination=tmp_path / "x.zip",
+            )
+
+        assert not (tmp_path / "x.zip").exists()
+        assert [p for p in tmp_path.glob(".altero-export-*")] == []
+
+
+class TestWorkspacePublishing:
+    """The archive is built privately, validated, then atomically published."""
+
+    async def export_populated(
+        self, session: AsyncSession, tmp_path: Path
+    ) -> tuple[Path, Path]:
+        source_storage = tmp_path / "source-storage"
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await populate(session, library, source_storage)
+        destination = tmp_path / "library.zip"
+        archived = await transfer.export_library(
+            session,
+            library_type=LibraryType.USER,
+            owner_id=1,
+            storage_root=source_storage,
+            destination=destination,
+        )
+        return archived, source_storage
+
+    async def test_only_the_published_archive_remains_and_manifest_is_last(
+        self, session: AsyncSession, tmp_path: Path
+    ) -> None:
+        archived, _ = await self.export_populated(session, tmp_path)
+
+        assert archived == tmp_path / "library.zip"
+        assert [p for p in tmp_path.glob(f"{transfer.WORKSPACE_PREFIX}*")] == []
+        with zipfile.ZipFile(archived) as bundle:
+            assert bundle.namelist()[-1] == transfer.MANIFEST
+            assert bundle.testzip() is None
+
+    async def test_a_write_failure_aborts_and_cleans(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await populate(session, library, tmp_path / "source-storage")
+
+        class FailingZip(zipfile.ZipFile):
+            def writestr(self, *args: Any, **kwargs: Any) -> None:
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(transfer.zipfile, "ZipFile", FailingZip)
+
+        with pytest.raises(ExportWriteError) as caught:
+            await transfer.export_library(
+                session,
+                library_type=LibraryType.USER,
+                owner_id=1,
+                storage_root=tmp_path / "source-storage",
+                destination=tmp_path / "library.zip",
+            )
+
+        assert "No space left" in caught.value.message
+        assert not (tmp_path / "library.zip").exists()
+        assert [p for p in tmp_path.glob(f"{transfer.WORKSPACE_PREFIX}*")] == []
+
+    async def test_a_publish_failure_aborts_and_cleans(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await populate(session, library, tmp_path / "source-storage")
+
+        def cannot_replace(source: Any, target: Any) -> None:
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(transfer.os, "replace", cannot_replace)
+
+        with pytest.raises(ExportPublishError) as caught:
+            await transfer.export_library(
+                session,
+                library_type=LibraryType.USER,
+                owner_id=1,
+                storage_root=tmp_path / "source-storage",
+                destination=tmp_path / "library.zip",
+            )
+
+        assert "Input/output error" in caught.value.message
+        assert not (tmp_path / "library.zip").exists()
+        assert [p for p in tmp_path.glob(f"{transfer.WORKSPACE_PREFIX}*")] == []
+
+    async def test_an_empty_library_exports_and_returns_empty(
+        self,
+        session: AsyncSession,
+        tmp_path: Path,
+        target: tuple[AsyncSession, Path],
+    ) -> None:
+        await make_user(session, user_id=1, username="octocat")
+        await get_library(session, LibraryType.USER, 1)
+
+        archived = await transfer.export_library(
+            session,
+            library_type=LibraryType.USER,
+            owner_id=1,
+            storage_root=tmp_path / "source-storage",
+            destination=tmp_path / "empty.zip",
+        )
+
+        with zipfile.ZipFile(archived) as bundle:
+            manifest = json.loads(bundle.read(transfer.MANIFEST))
+            members = bundle.namelist()
+
+        assert set(manifest["counts"].values()) == {0}
+        assert manifest["files"] == []
+        assert sorted(members) == sorted([transfer.MANIFEST, *transfer.DOCUMENT_NAMES])
+
+        target_session, target_storage = target
+        await make_user(target_session, user_id=1, username="octocat")
+        restored = await transfer.import_library(
+            target_session, archive=archived, storage_root=target_storage
+        )
+
+        assert await transfer.is_empty(target_session, restored)
+
+
+class TestAttachmentBoundary:
+    """Attachments belong to the same boundary as the database snapshot."""
+
+    async def test_a_attachment_that_disappears_aborts_the_export(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        source_storage = tmp_path / "source-storage"
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await populate(session, library, source_storage)
+        digest = storage.file_digest(SNAPSHOT)
+        attachment_path = storage.file_path(source_storage, digest)
+
+        class RacyZip(zipfile.ZipFile):
+            def writestr(self, name: Any, data: Any, *args: Any, **kwargs: Any) -> None:
+                super().writestr(name, data, *args, **kwargs)
+                if name == "deleted.json":
+                    # After the boundary, before the file is read.
+                    attachment_path.unlink()
+
+        monkeypatch.setattr(transfer.zipfile, "ZipFile", RacyZip)
+
+        with pytest.raises(AttachmentMissingError) as caught:
+            await transfer.export_library(
+                session,
+                library_type=LibraryType.USER,
+                owner_id=1,
+                storage_root=source_storage,
+                destination=tmp_path / "library.zip",
+            )
+
+        assert caught.value.digest == digest
+        assert "disappeared" in caught.value.message
+        assert not (tmp_path / "library.zip").exists()
+        assert [p for p in tmp_path.glob(f"{transfer.WORKSPACE_PREFIX}*")] == []
+
+    async def test_an_attachment_replaced_during_the_export_aborts(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        source_storage = tmp_path / "source-storage"
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await populate(session, library, source_storage)
+        digest = storage.file_digest(SNAPSHOT)
+        attachment_path = storage.file_path(source_storage, digest)
+
+        class RacyZip(zipfile.ZipFile):
+            def writestr(self, name: Any, data: Any, *args: Any, **kwargs: Any) -> None:
+                super().writestr(name, data, *args, **kwargs)
+                if name == transfer.MANIFEST:
+                    # Archived, but replaced before the final source check.
+                    attachment_path.write_bytes(b"completely different bytes here")
+
+        monkeypatch.setattr(transfer.zipfile, "ZipFile", RacyZip)
+
+        with pytest.raises(AttachmentChangedError) as caught:
+            await transfer.export_library(
+                session,
+                library_type=LibraryType.USER,
+                owner_id=1,
+                storage_root=source_storage,
+                destination=tmp_path / "library.zip",
+            )
+
+        assert caught.value.digest == digest
+        assert "replaced" in caught.value.message
+        assert not (tmp_path / "library.zip").exists()
+
+    async def test_a_digest_with_no_backing_file_is_not_an_error(
+        self, session: AsyncSession, tmp_path: Path
+    ) -> None:
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await make_item(
+            session,
+            library,
+            item_type="attachment",
+            fields={"md5": "f" * 32, "filename": "missing.pdf"},
+        )
+        await session.commit()
+
+        archived = await transfer.export_library(
+            session,
+            library_type=LibraryType.USER,
+            owner_id=1,
+            storage_root=tmp_path / "storage",
+            destination=tmp_path / "library.zip",
+        )
+
+        with zipfile.ZipFile(archived) as bundle:
+            manifest = json.loads(bundle.read(transfer.MANIFEST))
+        assert manifest["counts"]["files"] == 0
+        assert manifest["files"] == []
+
+    async def test_shared_digests_are_one_file_with_a_correct_record(
+        self, session: AsyncSession, tmp_path: Path
+    ) -> None:
+        import hashlib
+
+        source_storage = tmp_path / "source-storage"
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        digest = storage.file_digest(SNAPSHOT)
+        await make_item(
+            session,
+            library,
+            key="ATTACH001",
+            item_type="attachment",
+            fields={"md5": digest, "filename": "one.html"},
+        )
+        await make_item(
+            session,
+            library,
+            key="ATTACH002",
+            item_type="attachment",
+            fields={"md5": digest, "filename": "two.html"},
+        )
+        await session.commit()
+        path = storage.file_path(source_storage, digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(SNAPSHOT)
+
+        archived = await transfer.export_library(
+            session,
+            library_type=LibraryType.USER,
+            owner_id=1,
+            storage_root=source_storage,
+            destination=tmp_path / "library.zip",
+        )
+
+        with zipfile.ZipFile(archived) as bundle:
+            file_members = [n for n in bundle.namelist() if n.startswith(transfer.FILE_PREFIX)]
+            manifest = json.loads(bundle.read(transfer.MANIFEST))
+
+        assert file_members == [f"{transfer.FILE_PREFIX}{digest}"]
+        assert manifest["files"] == [
+            {
+                "digest": digest,
+                "size": len(SNAPSHOT),
+                "sha256": hashlib.sha256(SNAPSHOT).hexdigest(),
+            }
+        ]
+        assert manifest["counts"]["files"] == 1
+
+
+class TestImportCompatibility:
+    """Old archives import; new records are validated."""
+
+    def rewrite(self, archived: Path, mutate: Any) -> Path:
+        temporary = archived.with_name("rewritten.zip")
+        with (
+            zipfile.ZipFile(archived) as source,
+            zipfile.ZipFile(temporary, "w") as target,
+        ):
+            for entry in source.namelist():
+                body = source.read(entry)
+                if entry == transfer.MANIFEST:
+                    manifest = json.loads(body)
+                    mutate(manifest)
+                    body = json.dumps(manifest, indent=2).encode()
+                target.writestr(entry, body)
+        return temporary
+
+    async def make_archive(self, session: AsyncSession, tmp_path: Path) -> Path:
+        source_storage = tmp_path / "source-storage"
+        await make_user(session, user_id=1, username="octocat")
+        library = await get_library(session, LibraryType.USER, 1)
+        await populate(session, library, source_storage)
+        return await transfer.export_library(
+            session,
+            library_type=LibraryType.USER,
+            owner_id=1,
+            storage_root=source_storage,
+            destination=tmp_path / "library.zip",
+        )
+
+    async def test_an_archive_without_the_new_manifest_fields_imports(
+        self,
+        session: AsyncSession,
+        tmp_path: Path,
+        target: tuple[AsyncSession, Path],
+    ) -> None:
+        archived = await self.make_archive(session, tmp_path)
+
+        def make_old(manifest: dict[str, Any]) -> None:
+            manifest.pop("files", None)
+            manifest.pop("exportedAt", None)
+
+        old_archive = self.rewrite(archived, make_old)
+
+        target_session, target_storage = target
+        await make_user(target_session, user_id=1, username="octocat")
+        restored = await transfer.import_library(
+            target_session, archive=old_archive, storage_root=target_storage
+        )
+
+        assert restored.version == 37
+        assert not await transfer.is_empty(target_session, restored)
+
+    async def test_a_manifest_naming_a_missing_file_is_refused(
+        self,
+        session: AsyncSession,
+        tmp_path: Path,
+        target: tuple[AsyncSession, Path],
+    ) -> None:
+        archived = await self.make_archive(session, tmp_path)
+
+        def add_phantom(manifest: dict[str, Any]) -> None:
+            manifest["files"].append(
+                {"digest": "e" * 32, "size": 1, "sha256": "x"}
+            )
+
+        tampered = self.rewrite(archived, add_phantom)
+
+        target_session, target_storage = target
+        await make_user(target_session, user_id=1, username="octocat")
+        with pytest.raises(InvalidInputError, match="do not match"):
+            await transfer.import_library(
+                target_session, archive=tampered, storage_root=target_storage
+            )
+
+        assert not target_storage.exists()
+
+    async def test_a_malformed_files_record_is_refused(
+        self,
+        session: AsyncSession,
+        tmp_path: Path,
+        target: tuple[AsyncSession, Path],
+    ) -> None:
+        archived = await self.make_archive(session, tmp_path)
+        tampered = self.rewrite(
+            archived, lambda manifest: manifest.__setitem__("files", "nonsense")
+        )
+
+        target_session, target_storage = target
+        await make_user(target_session, user_id=1, username="octocat")
+        with pytest.raises(InvalidInputError, match="malformed"):
+            await transfer.import_library(
+                target_session, archive=tampered, storage_root=target_storage
+            )
+
+
+class TestWorkspaceRecovery:
+    """Restart recovery removes only old, unpublished workspaces."""
+
+    def make_workspace(self, root: Path, name: str, started_at: str) -> Path:
+        workspace = root / f"{transfer.WORKSPACE_PREFIX}{name}"
+        workspace.mkdir(parents=True)
+        (workspace / transfer.WORKSPACE_RECORD).write_text(
+            json.dumps({"startedAt": started_at}), encoding="utf-8"
+        )
+        (workspace / transfer.ARCHIVE_PART).write_bytes(b"partial")
+        return workspace
+
+    async def test_old_removed_young_kept_confirmed_archive_preserved(
+        self, tmp_path: Path
+    ) -> None:
+        export_path = tmp_path / "exports"
+        old = self.make_workspace(export_path, "old", "2000-01-01T00:00:00+00:00")
+        young = self.make_workspace(
+            export_path,
+            "young",
+            datetime.now(UTC).isoformat(),
+        )
+        published = export_path / "altero-user-1.zip"
+        published.write_bytes(b"KEEP ME")
+
+        reclaimed = transfer.recover_workspaces(
+            export_path, grace=timedelta(hours=1)
+        )
+
+        assert reclaimed == 1
+        assert not old.exists()
+        assert young.exists()
+        assert published.read_bytes() == b"KEEP ME"
+
+    async def test_a_workspace_without_a_sidecar_uses_directory_mtime(
+        self, tmp_path: Path
+    ) -> None:
+        import os
+
+        export_path = tmp_path / "exports"
+        old = export_path / f"{transfer.WORKSPACE_PREFIX}november"
+        old.mkdir(parents=True)
+        old_epoch = datetime(2000, 1, 1, tzinfo=UTC).timestamp()
+        os.utime(old, (old_epoch, old_epoch))
+
+        assert transfer.recover_workspaces(
+            export_path, grace=timedelta(hours=1)
+        ) == 1
+        assert not old.exists()
+
+    async def test_one_failed_removal_does_not_stop_the_rest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        export_path = tmp_path / "exports"
+        first = self.make_workspace(export_path, "first", "2000-01-01T00:00:00+00:00")
+        second = self.make_workspace(export_path, "second", "2000-01-02T00:00:00+00:00")
+        original_rmtree = transfer.shutil.rmtree
+
+        def selective_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+            if Path(path) == first:
+                raise OSError("busy")
+            original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(transfer.shutil, "rmtree", selective_rmtree)
+
+        reclaimed = transfer.recover_workspaces(
+            export_path, grace=timedelta(hours=1)
+        )
+
+        assert reclaimed == 1
+        assert first.exists()
+        assert not second.exists()
+
+    async def test_startup_recovery_failure_does_not_block_start(
+        self, app: Any, monkeypatch: pytest.MonkeyPatch, caplog: Any
+    ) -> None:
+        def broken(root: Any, *, grace: Any) -> int:
+            raise RuntimeError("disk gone")
+
+        monkeypatch.setattr(transfer, "recover_workspaces", broken)
+
+        with caplog.at_level("ERROR"):
+            async with app.router.lifespan_context(app):
+                pass  # start-up reached the yield and cleanly shut down
+
+        assert any("recovery failed" in record.message for record in caplog.records)
+
+    async def test_the_cli_command_reports_reclaimed_workspaces(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import argparse
+
+        from altero import cli
+
+        export_path = self.make_workspace(
+            tmp_path / "exports", "old", "2000-01-01T00:00:00+00:00"
+        ).parent
+        namespace = argparse.Namespace(path=[export_path], grace=0)
+
+        await cli._library_recover_exports(None, namespace)  # type: ignore[arg-type]
+
+        assert list(export_path.glob(f"{transfer.WORKSPACE_PREFIX}*")) == []
+
+    async def test_the_cli_command_without_paths_uses_the_export_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import argparse
+        import types
+
+        from altero import cli
+
+        export_path = tmp_path / "exports"
+        self.make_workspace(export_path, "old", "2000-01-01T00:00:00+00:00")
+        monkeypatch.setattr(
+            cli,
+            "get_settings",
+            lambda: types.SimpleNamespace(export_path=export_path),
+        )
+        namespace = argparse.Namespace(path=[], grace=0)
+
+        await cli._library_recover_exports(None, namespace)  # type: ignore[arg-type]
+
+        assert list(export_path.glob(f"{transfer.WORKSPACE_PREFIX}*")) == []
+
+
+class TestExportFailureContract:
+    """Each failure is a distinct, reported and cleaned-up event."""
+
+    def test_export_aborts_map_to_409(self) -> None:
+        from altero.api.errors import status_for
+
+        conflict = ExportConflictError(
+            "snapshot lost", library_type="user", owner_id=1
+        )
+        missing = AttachmentMissingError(
+            "file gone", digest="0" * 32, library_type="user", owner_id=1
+        )
+        changed = AttachmentChangedError(
+            "file replaced", digest="0" * 32, library_type="user", owner_id=1
+        )
+
+        for error in (conflict, missing, changed):
+            assert status_for(error) == 409
+
+    def test_write_and_publish_failures_map_to_500(self) -> None:
+        import errno
+
+        from altero.api.errors import status_for
+
+        cause = OSError(errno.ENOSPC, "No space left on device")
+        write = ExportWriteError("could not write archive", cause=cause)
+        publish = ExportPublishError("could not publish archive", cause=cause)
+
+        assert status_for(write) == 500
+        assert status_for(publish) == 500
+        assert write.cause is cause
+        assert publish.cause is cause
+
+    def test_errors_hold_diagnostic_context(self) -> None:
+        missing = AttachmentMissingError(
+            "file gone", digest="a" * 32, library_type="group", owner_id=7
+        )
+        changed = AttachmentChangedError(
+            "file replaced", digest="b" * 32, library_type="group", owner_id=7
+        )
+
+        assert missing.digest == "a" * 32
+        assert missing.owner_id == 7
+        assert missing.library_type == "group"
+        assert changed.digest == "b" * 32
+        # Independent classes rather than one undifferentiated failure.
+        assert type(missing) is not type(changed)
+
+    def test_the_default_export_directory_is_relative_exports(self) -> None:
+        from altero.settings import Settings
+
+        assert Settings().export_path == Path("exports")
 
 
 class TestRefusals:

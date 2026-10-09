@@ -57,6 +57,7 @@ from altero.services import (
     passkeys,
     passwordreset,
     retention,
+    transfer,
 )
 from altero.services.groupsweeper import Sweeper
 from altero.services.mail import build_mailer
@@ -96,6 +97,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Reclaim export workspaces from a previous, stopped process before
+        # anything can download. Confirmed archives are not touched; failure
+        # here is logged and does not block start-up.
+        try:
+            reclaimed = transfer.recover_workspaces(
+                settings.export_path, grace=transfer.RECOVERY_GRACE
+            )
+            if reclaimed:
+                logger.info(
+                    "Reclaimed %d unpublished export workspace(s) from %s",
+                    reclaimed,
+                    settings.export_path,
+                )
+        except Exception:
+            logger.exception(
+                "Export workspace recovery failed; continuing start-up"
+            )
+
         try:
             # Inside the dispose, so that leaving this block stops the sweepers
             # -- and waits for a sweep in flight -- while the database they are

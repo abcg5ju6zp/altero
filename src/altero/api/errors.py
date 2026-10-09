@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from altero.errors import (
     AlteroError,
+    ExportAbortedError,
     ForbiddenError,
     InvalidInputError,
     NotFoundError,
@@ -36,6 +37,8 @@ STATUS_CODES: dict[type[AlteroError], int] = {
     PreconditionFailedError: 412,
     RequestTooLargeError: 413,
     PreconditionRequiredError: 428,
+    # An export that lost its snapshot boundary: retryable as a fresh request.
+    ExportAbortedError: 409,
 }
 
 

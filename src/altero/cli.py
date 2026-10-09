@@ -8,7 +8,7 @@ import argparse
 import asyncio
 import getpass
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -413,6 +413,21 @@ async def _library_export(session: AsyncSession, args: argparse.Namespace) -> No
     print(f"Wrote {written}.")
 
 
+async def _library_recover_exports(
+    session: AsyncSession, args: argparse.Namespace
+) -> None:
+    """Reclaim unpublished export workspaces from a stopped process."""
+    paths = args.path or [get_settings().export_path]
+    grace = timedelta(minutes=args.grace)
+    total = 0
+    for path in paths:
+        count = transfer.recover_workspaces(path, grace=grace)
+        total += count
+        print(f"Reclaimed {count} workspace(s) from {path}.")
+    if total == 0:
+        print("No unpublished export workspaces beyond the grace period.")
+
+
 async def _library_import(session: AsyncSession, args: argparse.Namespace) -> None:
     library = await transfer.import_library(
         session,
@@ -719,6 +734,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="discard what the target library already holds, rather than refusing",
     )
     restore.set_defaults(handler=_library_import)
+
+    recover = library.add_parser(
+        "recover-exports",
+        help="reclaim unpublished export workspaces left by a stopped process",
+    )
+    recover.add_argument(
+        "path",
+        nargs="*",
+        type=Path,
+        help="directories to scan (default: the configured export directory)",
+    )
+    recover.add_argument(
+        "--grace",
+        type=int,
+        default=60,
+        help="workspaces younger than N minutes are left alone "
+        "(default: %(default)s)",
+    )
+    recover.set_defaults(handler=_library_recover_exports)
 
     return parser
 

@@ -15,6 +15,8 @@ it opens for and what it refuses:
 import io
 import json
 import zipfile
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -156,6 +158,67 @@ class TestExport:
         response = await ada.get(f"/web/libraries/{group['id']}/archive")
 
         assert response.status_code == 403
+
+    async def test_a_failed_export_returns_409_and_leaves_nothing(
+        self,
+        ada: httpx.AsyncClient,
+        session: AsyncSession,
+        app: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from altero.services import storage
+
+        snapshot = b"<html><body>x</body></html>"
+        library = await personal(session, 1)
+        digest = storage.file_digest(snapshot)
+        await factories.make_item(
+            session,
+            library,
+            key="ATT000001",
+            item_type="attachment",
+            fields={"md5": digest, "filename": "x.html"},
+            version=8,
+        )
+        library.version = 8
+        await session.commit()
+
+        source = storage.file_path(app.state.settings.storage_path, digest)
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(snapshot)
+
+        class RacyZip(zipfile.ZipFile):
+            def writestr(self, name: Any, data: Any, *args: Any, **kwargs: Any) -> None:
+                super().writestr(name, data, *args, **kwargs)
+                if name == "deleted.json":
+                    source.unlink()
+
+        monkeypatch.setattr(transfer.zipfile, "ZipFile", RacyZip)
+
+        response = await ada.get(f"/web/libraries/{library.id}/archive")
+
+        assert response.status_code == 409
+        assert "disappeared" in response.json()["message"]
+        export_root = Path(app.state.settings.export_path)
+        assert [p for p in export_root.iterdir()] == []
+
+    async def test_export_workspace_files_are_not_reachable_as_urls(
+        self, ada: httpx.AsyncClient
+    ) -> None:
+        response = await ada.get("/exports/.altero-export-x/archive.part")
+
+        assert response.status_code == 404
+
+    async def test_the_published_file_is_removed_after_the_download(
+        self, ada: httpx.AsyncClient, session: AsyncSession, app: Any
+    ) -> None:
+        library = await personal(session, 1)
+        await seed(session, library, "A Book")
+        export_root = Path(app.state.settings.export_path)
+
+        response = await ada.get(f"/web/libraries/{library.id}/archive")
+
+        assert response.status_code == 200
+        assert [p for p in export_root.iterdir()] == []
 
 
 async def make_signed_in_existing(

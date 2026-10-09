@@ -21,6 +21,12 @@ DEBUG = False
 # Directory holding attachment files.
 STORAGE_PATH = "./storage"
 
+# Directory where whole-library archive exports are assembled in a private
+# temporary workspace and published before being downloaded. Start-up reclaims
+# unpublished workspaces left by a failed process; published archives are never
+# removed automatically.
+EXPORT_PATH = "./exports"
+
 # Requests allowed per API key, or per address when unauthenticated, in each
 # window. Zero disables the limit. A caller over it gets 429 with Retry-After.
 RATE_LIMIT = 0

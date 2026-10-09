@@ -23,6 +23,7 @@ def settings(tmp_path: Path) -> Settings:
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'test.sqlite'}",
         storage_path=tmp_path / "storage",
+        export_path=tmp_path / "exports",
     )
 
 

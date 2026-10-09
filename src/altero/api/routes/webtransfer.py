@@ -20,6 +20,7 @@ who could upload it.
 import shutil
 import tempfile
 from pathlib import Path
+from secrets import token_hex
 from typing import Annotated
 
 from fastapi import APIRouter, File, Form, UploadFile
@@ -80,35 +81,42 @@ async def _may_import(session: SessionDep, library: Library, user: User) -> None
 async def download_archive(
     request: Request, session: SessionDep, user: CurrentUserDep, library_id: int
 ) -> Response:
-    """Write the library to an archive and send it.
+    """Write the library to a published archive and send it.
 
-    Built on disk and streamed from there rather than assembled in memory: with
-    the attachments in it, an archive is as large as the library. The temporary
-    copy is removed once the response has been sent, whether or not the browser
-    stayed to the end of it.
+    The export reads through a session of its own so that its snapshot
+    transaction starts before any statement. The archive is built in a
+    private workspace inside the export directory and, after full
+    validation, atomically published there: nothing at a downloadable
+    name exists until the archive is whole. The published file is removed
+    once the response has been sent. A failed export raises before this
+    returns, and leaves no workspace behind.
     """
     library = await _library_or_404(session, library_id)
     await _may_export(session, library, user)
 
-    workspace = Path(tempfile.mkdtemp(prefix="altero-export-"))
+    export_directory = Path(request.app.state.settings.export_path)
+    export_directory.mkdir(parents=True, exist_ok=True)
     name = f"altero-{library.type.value}-{library.owner_id}.zip"
-    try:
+    # A unique on-disk name keeps concurrent exports of the same library
+    # apart; the browser is still offered the plain name.
+    destination = export_directory / (
+        f"altero-{library.type.value}-{library.owner_id}-{token_hex(8)}.zip"
+    )
+
+    async with request.app.state.database.session_factory() as export_session:
         written = await transfer.export_library(
-            session,
+            export_session,
             library_type=library.type,
             owner_id=library.owner_id,
             storage_root=Path(request.app.state.settings.storage_path),
-            destination=workspace / name,
+            destination=destination,
         )
-    except BaseException:
-        shutil.rmtree(workspace, ignore_errors=True)
-        raise
 
     return FileResponse(
         written,
         media_type="application/zip",
         filename=name,
-        background=BackgroundTask(shutil.rmtree, workspace, ignore_errors=True),
+        background=BackgroundTask(Path.unlink, written, missing_ok=True),
     )
 
 

@@ -46,13 +46,16 @@ def _configure_sqlite(engine: AsyncEngine) -> None:
     - The rollback journal blocks readers while a write is in progress. WAL lets
       them run alongside it.
     What is deliberately not done here is beginning every transaction with
-    ``BEGIN IMMEDIATE``. It would close the remaining hole — a transaction that
-    reads and then writes can fail outright when it upgrades its lock, which
-    ``busy_timeout`` does not cover — but it takes the write lock for read-only
-    transactions too, so a single long read blocks every writer. That is a worse
-    trade than the hole it fills. A deployment serving more than one client at a
-    time should use PostgreSQL, where the row lock in the write path does the
-    job properly.
+    ``BEGIN IMMEDIATE``. It would close two remaining holes — a transaction
+    that reads and then writes can fail outright when it upgrades its lock,
+    which ``busy_timeout`` does not cover, and a long read has no snapshot
+    guarantee — but it takes the write lock for read-only transactions too, so
+    a single long read blocks every writer. That is a worse trade than the
+    holes it fills. Read paths that require a stable snapshot (whole-library
+    export) establish their own explicit snapshot transaction, scoped to that
+    operation; see ``altero.services.transfer._begin_snapshot``. A deployment
+    serving more than one client at a time should use PostgreSQL, where the
+    row lock in the write path does the job properly.
     """
     if engine.dialect.name != "sqlite":
         return

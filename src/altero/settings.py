@@ -42,6 +42,17 @@ class Settings(BaseSettings):
         description="Directory holding attachment files.",
     )
 
+    export_path: Path = Field(
+        default=Path("./exports"),
+        description=(
+            "Directory where whole-library archive exports are assembled in a "
+            "private temporary workspace and published before being "
+            "downloaded. A failed process leaves only unpublished "
+            "workspaces here, which start-up reclaims; published archives "
+            "are never removed automatically."
+        ),
+    )
+
     open_registration: bool = Field(
         default=False,
         description=(
