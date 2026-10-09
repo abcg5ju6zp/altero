@@ -33,9 +33,9 @@ class GroupActivity(Base):
     because a large group would then cost fifty inserts on the sync path --
     the fan-out is the sweep's job, off anybody's request.
 
-    Rows survive delivery, stamped with ``flushed`` rather than deleted. What
-    is left is a per-library record of who changed what and when, which is the
-    substrate an activity log would be built from.
+    Rows survive delivery, stamped with ``flushed`` and ``digest_id`` rather
+    than deleted. What is left is a per-library record of who changed what and
+    when, which is the substrate an activity log would be built from.
     """
 
     __tablename__ = "group_activity"
@@ -60,6 +60,12 @@ class GroupActivity(Base):
     #: When the sweep took this row. Null means it is still waiting, and is
     #: what the sweep claims against so two of them cannot send the same digest.
     flushed: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    #: The established digest this row belongs to. Set in the same transaction
+    #: as ``flushed``; the stable identity the per-recipient delivery progress
+    #: hangs from. Set null only if that digest row ever goes away.
+    digest_id: Mapped[int | None] = mapped_column(
+        ForeignKey("group_digests.id", ondelete="SET NULL"), default=None, index=True
+    )
 
     #: Loaded only where it is wanted. The sweep that sends digests reads the
     #: counts and never the names, and ``selectin`` here would make every sweep

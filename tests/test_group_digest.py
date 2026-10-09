@@ -15,12 +15,20 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altero.models import ActivityKind, GroupActivity, Library, Notification
+from altero.models import (
+    ActivityKind,
+    GroupActivity,
+    GroupDigest,
+    GroupDigestRecipient,
+    Library,
+    Notification,
+)
 from altero.services import groupactivity, groupdigest, groupprefs
 from altero.services.mail import Message
-from tests.factories import make_group, make_user
+from tests.factories import add_group_member, make_group, make_user
 
 #: Long enough that nothing is due unless a test says so.
 QUIET = timedelta(minutes=15)
@@ -241,7 +249,6 @@ class TestWhatItSays:
         self, session: AsyncSession, group: Library, outbox: Outbox
     ) -> None:
         await make_user(session, user_id=3, username="carol")
-        from tests.factories import add_group_member
 
         await add_group_member(session, library_id=group.id, user_id=3)
         await groupprefs.set_kind(
@@ -330,3 +337,407 @@ class TestFailures:
         await groupdigest.sweep(session, explode, quiet_period=QUIET)
 
         assert len(await notices(session, 2)) == 1
+
+
+#: Stand-in for the process being killed between recipients. A BaseException,
+#: like SIGTERM, so the digest code cannot be said to have caught it.
+class ProcessKilled(BaseException):
+    pass
+
+
+class Refusing:
+    """A relay that refuses everything, counting how often it was tried."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def send(self, message: Message) -> bool:
+        self.attempts += 1
+        return False
+
+
+class DiesAt:
+    """Dies -- as a process can -- when asked to send to one address."""
+
+    def __init__(self, address: str) -> None:
+        self.address = address
+        self.sent: list[Message] = []
+
+    async def send(self, message: Message) -> bool:
+        if message.to == self.address:
+            raise ProcessKilled
+        self.sent.append(message)
+        return True
+
+
+async def digests(session: AsyncSession) -> list[GroupDigest]:
+    return list(await session.scalars(select(GroupDigest).order_by(GroupDigest.id)))
+
+
+async def recipient_rows(session: AsyncSession) -> list[GroupDigestRecipient]:
+    return list(
+        await session.scalars(select(GroupDigestRecipient).order_by(GroupDigestRecipient.id))
+    )
+
+
+async def make_member(
+    session: AsyncSession,
+    group: Library,
+    *,
+    user_id: int,
+    username: str,
+    email: str | None,
+) -> None:
+    """Create a member subscribed to everything the test group records."""
+    await make_user(session, user_id=user_id, username=username, email=email)
+    await add_group_member(session, library_id=group.id, user_id=user_id)
+    for kind in ActivityKind:
+        await groupprefs.set_kind(session, group, user_id=user_id, kind=kind, wanted=True)
+    await session.commit()
+
+
+async def age_email_attempt(session: AsyncSession, minutes: int = 5) -> None:
+    """Backdate a pending email attempt, as waiting out the retry lease does."""
+    when = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=minutes)
+    await session.execute(update(GroupDigestRecipient).values(last_attempt_at=when))
+    await session.commit()
+
+
+class TestBatchIdentity:
+    async def test_claimed_rows_and_recipients_belong_to_one_digest(
+        self, session: AsyncSession, group: Library, outbox: Outbox
+    ) -> None:
+        await record(session, group, count=2)
+        await age(session, minutes=30)
+
+        await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+
+        (batch,) = await digests(session)
+        (recipient,) = await recipient_rows(session)
+        rows = list(await session.scalars(select(GroupActivity)))
+        assert rows[0].digest_id == batch.id
+        assert rows[0].flushed is not None
+        assert recipient.digest_id == batch.id
+        assert recipient.user_id == 2
+        assert recipient.email == "bob@example.org"
+        assert batch.completed_at is not None
+
+    async def test_losing_the_claim_leaves_one_digest_and_no_double_recipients(
+        self, session: AsyncSession, group: Library, outbox: Outbox
+    ) -> None:
+        # The loser of a candidate race must leave no trace: no second batch,
+        # no second recipients, and a normal sweep afterwards delivers once.
+        await record(session, group)
+        await age(session, minutes=30)
+
+        winner = await groupdigest._establish(session, group.id)
+        loser = await groupdigest._establish(session, group.id)
+
+        assert winner is not None
+        assert loser is None
+        assert len(await digests(session)) == 1
+        assert len(await recipient_rows(session)) == 1
+
+        told = await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+
+        assert told == 1
+        assert len(outbox.sent) == 1
+        assert len(await digests(session)) == 1
+        assert len(await recipient_rows(session)) == 1
+
+
+class TestPreferenceSnapshot:
+    async def test_changes_after_establishment_do_not_alter_this_batch(
+        self, session: AsyncSession, group: Library, outbox: Outbox
+    ) -> None:
+        # Carol is not subscribed when the batch settles; Bob is.
+        await make_member(session, group, user_id=3, username="carol", email="carol@example.org")
+        for kind in ActivityKind:
+            await groupprefs.set_kind(session, group, user_id=3, kind=kind, wanted=False)
+        await session.commit()
+        await record(session, group)
+        await age(session, minutes=30)
+
+        # The batch is established, and only then do preferences move: Bob
+        # unsubscribes and Carol subscribes.
+        batch = await groupdigest._establish(session, group.id)
+        assert batch is not None
+        for kind in ActivityKind:
+            await groupprefs.set_kind(session, group, user_id=2, kind=kind, wanted=False)
+            await groupprefs.set_kind(session, group, user_id=3, kind=kind, wanted=True)
+        await session.commit()
+
+        told = await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+
+        assert told == 1
+        assert len(await notices(session, 2)) == 1
+        assert await notices(session, 3) == []
+        assert [message.to for message in outbox.sent] == ["bob@example.org"]
+
+    async def test_changes_after_establishment_do_apply_to_the_next_batch(
+        self, session: AsyncSession, group: Library, outbox: Outbox
+    ) -> None:
+        await make_member(session, group, user_id=3, username="carol", email="carol@example.org")
+        for kind in ActivityKind:
+            await groupprefs.set_kind(session, group, user_id=3, kind=kind, wanted=False)
+        await session.commit()
+        await record(session, group)
+        await age(session, minutes=30)
+        batch = await groupdigest._establish(session, group.id)
+        assert batch is not None
+        for kind in ActivityKind:
+            await groupprefs.set_kind(session, group, user_id=2, kind=kind, wanted=False)
+            await groupprefs.set_kind(session, group, user_id=3, kind=kind, wanted=True)
+        await session.commit()
+        await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+        outbox.sent.clear()
+
+        # A later burst is established under the new preferences.
+        await record(session, group)
+        await age(session, minutes=30)
+        await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+
+        assert len(await notices(session, 2)) == 1
+        assert len(await notices(session, 3)) == 1
+        assert [message.to for message in outbox.sent] == ["carol@example.org"]
+
+
+class TestResumingAfterAnExit:
+    async def test_a_process_killed_mid_fan_out_is_resumed_without_duplicates(
+        self, session: AsyncSession, group: Library, app, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Four recipients in id order: bob, carol, dave, erin. The process
+        # dies while sending carol's mail. Bob is fully done; carol's notice
+        # is durable but her mail is pending; dave and erin are untouched.
+        await make_member(session, group, user_id=3, username="carol", email="carol@example.org")
+        await make_member(session, group, user_id=4, username="dave", email="dave@example.org")
+        await make_member(session, group, user_id=5, username="erin", email="erin@example.org")
+        await record(session, group)
+        await age(session, minutes=30)
+
+        with pytest.raises(ProcessKilled):
+            await groupdigest.sweep(session, DiesAt("carol@example.org").send, quiet_period=QUIET)
+
+        assert len(await notices(session, 2)) == 1
+        assert len(await notices(session, 3)) == 1
+        assert await notices(session, 4) == []
+        assert await notices(session, 5) == []
+
+        # A restart: new process, new session, and the pending attempt is old.
+        monkeypatch.setattr(groupdigest, "EMAIL_ATTEMPT_LEASE", timedelta(0))
+        outbox = Outbox()
+        async with app.state.database.session_factory() as restarted:
+            told = await groupdigest.sweep(restarted, outbox.send, quiet_period=QUIET)
+
+        # Carol is not told again; dave and erin are.
+        assert told == 2
+        for user_id in (2, 3, 4, 5):
+            assert len(await notices(session, user_id)) == 1
+        assert sorted(message.to for message in outbox.sent) == [
+            "carol@example.org",
+            "dave@example.org",
+            "erin@example.org",
+        ]
+        (batch,) = await digests(session)
+        assert batch.completed_at is not None
+
+    async def test_a_pending_email_after_restart_keeps_the_single_notification(
+        self,
+        session: AsyncSession,
+        group: Library,
+        outbox: Outbox,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        refusing = Refusing()
+        await record(session, group)
+        await age(session, minutes=30)
+        await groupdigest.sweep(session, refusing.send, quiet_period=QUIET)
+
+        (recipient,) = await recipient_rows(session)
+        assert recipient.email_state == "pending"
+        assert recipient.notification_id is not None
+        assert recipient.email_attempts == 1
+        assert (await digests(session))[0].completed_at is None
+
+        # Restart finishes the email without raising another notification.
+        monkeypatch.setattr(groupdigest, "EMAIL_ATTEMPT_LEASE", timedelta(0))
+        told = await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+
+        assert told == 0
+        assert len(await notices(session, 2)) == 1
+        assert [message.to for message in outbox.sent] == ["bob@example.org"]
+        (recipient,) = await recipient_rows(session)
+        assert recipient.email_state == "sent"
+        assert (await digests(session))[0].completed_at is not None
+
+
+class TestEmailRetries:
+    async def test_one_refusing_address_does_not_stop_the_rest(
+        self, session: AsyncSession, group: Library, outbox: Outbox
+    ) -> None:
+        # The original loss: one mailbox refusing ended the batch, so everyone
+        # later in the fan-out never heard anything.
+        await make_member(session, group, user_id=3, username="carol", email="carol@example.org")
+        await record(session, group)
+        await age(session, minutes=30)
+
+        async def send(message: Message) -> bool:
+            if message.to == "bob@example.org":
+                return False
+            outbox.sent.append(message)
+            return True
+
+        told = await groupdigest.sweep(session, send, quiet_period=QUIET)
+
+        assert told == 2
+        assert len(await notices(session, 2)) == 1
+        assert len(await notices(session, 3)) == 1
+        assert [message.to for message in outbox.sent] == ["carol@example.org"]
+        by_user = {row.user_id: row for row in await recipient_rows(session)}
+        assert by_user[2].email_state == "pending"
+        assert by_user[3].email_state == "sent"
+
+    async def test_a_refusal_is_not_retried_while_its_attempt_is_fresh(
+        self, session: AsyncSession, group: Library
+    ) -> None:
+        # The attempt lease: a sweep tick beside a long SMTP call must not send
+        # a second copy, and a rejecting relay is not hammered every tick.
+        refusing = Refusing()
+        await record(session, group)
+        await age(session, minutes=30)
+
+        await groupdigest.sweep(session, refusing.send, quiet_period=QUIET)
+        await groupdigest.sweep(session, refusing.send, quiet_period=QUIET)
+
+        assert refusing.attempts == 1
+
+    async def test_a_refusal_is_retried_after_the_lease_and_succeeds_once(
+        self, session: AsyncSession, group: Library, outbox: Outbox
+    ) -> None:
+        refusing = Refusing()
+        await record(session, group)
+        await age(session, minutes=30)
+        await groupdigest.sweep(session, refusing.send, quiet_period=QUIET)
+        assert refusing.attempts == 1
+        assert outbox.sent == []
+
+        await age_email_attempt(session)
+        told = await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+
+        assert told == 0
+        assert len(outbox.sent) == 1
+        assert len(await notices(session, 2)) == 1
+        (recipient,) = await recipient_rows(session)
+        assert recipient.email_state == "sent"
+        assert recipient.email_attempts == 2
+
+    async def test_a_mailer_that_raises_is_retried_after_restart(
+        self,
+        session: AsyncSession,
+        group: Library,
+        outbox: Outbox,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        attempts = 0
+
+        async def flaky(message: Message) -> bool:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("relay on fire")
+            outbox.sent.append(message)
+            return True
+
+        await record(session, group)
+        await age(session, minutes=30)
+        await groupdigest.sweep(session, flaky, quiet_period=QUIET)
+        assert len(await notices(session, 2)) == 1
+        assert outbox.sent == []
+
+        await age_email_attempt(session)
+        monkeypatch.setattr(groupdigest, "EMAIL_ATTEMPT_LEASE", timedelta(0))
+        await groupdigest.sweep(session, flaky, quiet_period=QUIET)
+
+        assert len(outbox.sent) == 1
+        assert len(await notices(session, 2)) == 1
+        (recipient,) = await recipient_rows(session)
+        assert recipient.email_state == "sent"
+
+
+class TestCommitFailure:
+    async def test_a_notification_commit_failure_is_retried_without_duplicates(
+        self,
+        session: AsyncSession,
+        group: Library,
+        outbox: Outbox,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Establishment is the first commit; bob's notification the second.
+        # Fail that second commit: nothing about the notification is durable,
+        # so the next tick must make exactly one rather than zero or two.
+        await record(session, group)
+        await age(session, minutes=30)
+
+        real_commit = session.commit
+        calls = 0
+
+        async def flaky_commit() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OperationalError(None, None, RuntimeError("disk full"))
+            await real_commit()
+
+        monkeypatch.setattr(session, "commit", flaky_commit)
+        told = await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+        assert told == 0
+        assert await notices(session, 2) == []
+        (recipient,) = await recipient_rows(session)
+        assert recipient.notification_id is None
+
+        monkeypatch.undo()
+        told = await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+
+        assert told == 1
+        assert len(await notices(session, 2)) == 1
+        assert len(outbox.sent) == 1
+        (recipient,) = await recipient_rows(session)
+        assert recipient.notification_id is not None
+        assert recipient.email_state == "sent"
+
+
+class TestEmpty:
+    async def test_no_subscribers_completes_an_empty_digest(
+        self, session: AsyncSession, group: Library, outbox: Outbox
+    ) -> None:
+        for kind in ActivityKind:
+            await groupprefs.set_kind(session, group, user_id=2, kind=kind, wanted=False)
+        await session.commit()
+        await record(session, group)
+        await age(session, minutes=30)
+
+        assert await groupdigest.sweep(session, outbox.send, quiet_period=QUIET) == 0
+        assert await notices(session, 2) == []
+        assert await recipient_rows(session) == []
+        (batch,) = await digests(session)
+        assert batch.completed_at is not None
+
+        # Nothing left to resume: a later sweep changes nothing.
+        assert await groupdigest.sweep(session, outbox.send, quiet_period=QUIET) == 0
+        assert await notices(session, 2) == []
+
+    async def test_no_email_address_is_a_terminal_state_not_a_pending_one(
+        self, session: AsyncSession, group: Library, outbox: Outbox
+    ) -> None:
+        await make_member(session, group, user_id=3, username="carol", email=None)
+        await record(session, group)
+        await age(session, minutes=30)
+
+        await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+        await groupdigest.sweep(session, outbox.send, quiet_period=QUIET)
+
+        assert len(await notices(session, 3)) == 1
+        assert [message.to for message in outbox.sent] == ["bob@example.org"]
+        rows = {row.user_id: row for row in await recipient_rows(session)}
+        assert rows[3].email_state == "none"
+        assert rows[2].email_state == "sent"

@@ -30,6 +30,8 @@ from altero.models import (
     ApiKeyGroupAccess,
     Group,
     GroupActivity,
+    GroupDigest,
+    GroupDigestRecipient,
     GroupMember,
     Invitation,
     Library,
@@ -557,6 +559,13 @@ async def delete_group(session: AsyncSession, library: Library) -> None:
     )
     await session.execute(delete(Invitation).where(Invitation.library_id == library.id))
     await session.execute(delete(GroupActivity).where(GroupActivity.library_id == library.id))
+    # Digest delivery progress goes too: there is no library left to invite
+    # anybody to look at. Recipients first, then the digests that own them.
+    digest_ids = select(GroupDigest.id).where(GroupDigest.library_id == library.id)
+    await session.execute(
+        delete(GroupDigestRecipient).where(GroupDigestRecipient.digest_id.in_(digest_ids))
+    )
+    await session.execute(delete(GroupDigest).where(GroupDigest.library_id == library.id))
 
     members = [member.user_id for _, member in await list_members(session, library)]
     await session.execute(delete(GroupMember).where(GroupMember.library_id == library.id))

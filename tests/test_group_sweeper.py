@@ -1,15 +1,15 @@
 """The periodic task that runs the digest sweep.
 
-The one piece of machinery this feature adds. `docs/email.md` says altero has
-no queue and no retry, and this does not change that: nothing is queued and
-nothing is retried. What runs on a timer is the decision that a burst has
-finished, which cannot be made at the moment of a write because the write does
-not know whether another is coming.
+The one piece of machinery this feature adds. What runs on a timer is the
+decision that a burst has finished, which cannot be made at the moment of a
+write because the write does not know whether another is coming. Delivery
+progress lives in the database, so a sweep cut off mid-batch is resumed on a
+later tick rather than queued or retried by this loop.
 
 Like the streaming broker, it lives in one process. Unlike the broker, running
-several is safe rather than merely partial -- the claim in
-:mod:`altero.services.groupdigest` means two sweeps cannot send the same
-digest.
+several is safe rather than merely partial -- the claim and per-recipient
+progress in :mod:`altero.services.groupdigest` mean two sweeps cannot send the
+same digest.
 """
 
 import asyncio
@@ -71,9 +71,10 @@ class TestRunning:
         assert recorder.runs == after
 
     async def test_a_sweep_in_progress_is_awaited_on_shutdown(self) -> None:
-        # Cancelling between the claim and the sending would leave rows stamped
-        # as delivered that nobody was told about, which is the one state
-        # nothing else recovers from: the next sweep skips them.
+        # Cutting a sweep off mid-delivery is recoverable -- its progress is
+        # durable and the next sweep resumes it -- but abandoning one still
+        # wastes the work and races the sweep that takes over, so shutdown
+        # waits for it.
         recorder = Recorder()
         recorder.gate = asyncio.Event()
         sweeper = Sweeper(recorder.sweep, interval=timedelta(seconds=0.01))

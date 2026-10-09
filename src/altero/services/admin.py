@@ -17,6 +17,7 @@ from altero.models import (
     ApiKeyGroupAccess,
     EmailVerification,
     Group,
+    GroupDigestRecipient,
     GroupMember,
     Invitation,
     Library,
@@ -182,6 +183,10 @@ async def delete_user(session: AsyncSession, user: User) -> None:
     await session.execute(delete(TotpCredential).where(TotpCredential.user_id == user.id))
     await session.execute(delete(EmailVerification).where(EmailVerification.user_id == user.id))
     await session.execute(delete(Notification).where(Notification.user_id == user.id))
+    # Their place in any digest still being delivered goes with the account.
+    await session.execute(
+        delete(GroupDigestRecipient).where(GroupDigestRecipient.user_id == user.id)
+    )
     # Invitations they sent as well as ones addressed to them: `invited_by`
     # points here and cannot be left dangling.
     await session.execute(

@@ -12,6 +12,7 @@ from altero.models.collection import (
     CollectionRelation,
     CollectionShare,
 )
+from altero.models.digest import DigestEmailState, GroupDigest, GroupDigestRecipient
 from altero.models.fulltext import FullText
 from altero.models.identity import (
     AuthRequest,
@@ -71,6 +72,7 @@ __all__ = [
     "ConsumedAssertion",
     "DeletedObject",
     "DeletedObjectType",
+    "DigestEmailState",
     "EmailFactor",
     "EmailVerification",
     "FederatedIdentity",
@@ -78,6 +80,8 @@ __all__ = [
     "Group",
     "GroupActivity",
     "GroupActivityObject",
+    "GroupDigest",
+    "GroupDigestRecipient",
     "GroupMember",
     "IdentityProvider",
     "InstanceSetting",

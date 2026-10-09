@@ -183,7 +183,7 @@ The email contains counts, not item titles. Detailed activity remains in the aut
 
 Digest processing is coordinated in the database, so several application workers do not send the same digest twice.
 
-There is no retry queue. If a relay refuses a digest, altero logs the failure and still keeps the in-app notification.
+Each digest keeps durable, per-recipient delivery progress. The in-app notification is the channel that completes a recipient; a relay that refuses a digest email, an attempt interrupted by a restart, or a sweep stopped halfway through a large batch leaves that recipient's email recorded as pending and it is sent on a later sweep, while the in-app notification is never created twice. Preferences are snapshotted when a batch is established, so changing them afterwards affects only the next digest.
 
 ## Check mail delivery
 
@@ -209,7 +209,7 @@ This prints received messages instead of sending real mail.
 
 Mail failure does not roll back the action that caused the message. For example, a password change remains a password change even if the security notice cannot be delivered.
 
-Failures are logged. There is no mail queue and no automatic retry. Most user-triggered messages can be requested again.
+Failures are logged. There is no mail queue and no automatic retry for messages a user action triggers; most can be requested again. Group digest email is the exception: its delivery progress persists and a later sweep finishes it.
 
 Mail sending runs on a worker thread with a 10-second timeout so a slow relay does not block the server's event loop.
 

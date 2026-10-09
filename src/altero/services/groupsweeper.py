@@ -1,14 +1,17 @@
 """Running the digest sweep on a timer.
 
 The only machinery this feature adds, and deliberately the smallest that will
-do. `docs/email.md` says altero has no queue and no retry; that stands. Nothing
-is queued here and nothing is retried. What runs on a timer is the *decision*
-that a burst of writes has finished, which cannot be made at the moment of a
-write because a write does not know whether another is coming.
+do. What runs on a timer is the *decision* that a burst of writes has
+finished, which cannot be made at the moment of a write because a write does
+not know whether another is coming. The delivery itself is durable in the
+database -- :mod:`altero.services.groupdigest` records each recipient's
+progress -- so an unfinished batch is simply continued on a later tick rather
+than queued in memory or retried by this loop.
 
 Running more than one of these is safe, unlike the streaming broker: the claim
-in :mod:`altero.services.groupdigest` means two sweeps cannot deliver the same
-activity, so an instance behind several workers sends one digest, not one per
+in :mod:`altero.services.groupdigest` means two sweeps cannot establish the
+same digest, and the per-recipient progress means they cannot finish it twice
+either, so an instance behind several workers sends one digest, not one per
 worker.
 """
 
@@ -61,11 +64,12 @@ class Sweeper:
     async def aclose(self) -> None:
         """Stop sweeping, waiting for one in progress to finish.
 
-        Cancelled between the claim and the sending, a sweep would leave rows
-        stamped as delivered that nobody was told about -- the one state
-        nothing else recovers from, since the next sweep skips them. So the
-        loop is cancelled but the sweep it was running is awaited: the
-        cancellation lands while waiting for the next tick, never mid-sweep.
+        A sweep interrupted mid-delivery no longer loses anything -- the
+        digest's per-recipient progress is committed as it goes and the next
+        sweep resumes it -- but cancelling it in the middle would still do
+        pointless work and race the sweep that picks up after it. So the loop
+        is cancelled but the sweep it was running is awaited: the cancellation
+        lands while waiting for the next tick, never mid-sweep.
         """
         task, self._task = self._task, None
         if task is not None:
