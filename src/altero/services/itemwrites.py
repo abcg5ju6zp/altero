@@ -34,7 +34,7 @@ from altero.models import (
     Tag,
     TagType,
 )
-from altero.services import itemdata
+from altero.services import itemdata, storage
 from altero.services.auth import Access
 from altero.services.deletions import record_deletion
 from altero.services.items import get_item, in_collections, tags_for
@@ -436,6 +436,19 @@ async def _apply(
         item.parent_id = None
 
     await session.flush()
+
+    # A generic write can name an md5 as well -- a copied attachment, a sync
+    # replay, a restore -- and those never go through the file protocol that
+    # revokes a deletion lease itself. Any candidate the orphan sweep is
+    # deciding for such a digest has to be revoked in this same transaction,
+    # the same way storage.register does: the sweep's write claim and this
+    # DELETE serialise on the one row. Almost always zero rows match; the
+    # statement only matters while an operator is running a purge.
+    md5s = {
+        field.value for field in item.fields if field.field == "md5" and field.value
+    }
+    for digest in md5s:
+        await storage.revoke_delete_lease(session, digest)
 
     if replace or "tags" in parsed["mentioned"]:
         await session.execute(delete(ItemTag).where(ItemTag.item_id == item.id))

@@ -21,7 +21,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from altero.errors import (
@@ -31,12 +31,23 @@ from altero.errors import (
     PreconditionRequiredError,
 )
 from altero.keys import generate_api_key
-from altero.models import Item, ItemField, Library, StorageDownload, StorageUpload
+from altero.models import (
+    Item,
+    ItemField,
+    Library,
+    StorageDeleteLease,
+    StorageDownload,
+    StorageUpload,
+)
 
 logger = logging.getLogger("altero.storage")
 
 #: Fields an attachment carries once a file is attached to it.
 FILE_FIELDS = ("filename", "md5", "mtime", "contentType", "charset")
+
+#: The two states a deletion lease can be in. See StorageDeleteLease.
+LEASE_CANDIDATE = "candidate"
+LEASE_DELETED = "deleted"
 
 #: How long the permission a download redirect hands out is good for.
 #:
@@ -253,6 +264,78 @@ def parse_authorization(form: dict[str, str]) -> dict[str, Any]:
     }
 
 
+async def revoke_delete_lease(session: AsyncSession, md5: str) -> int:
+    """Cancel a pending deletion of one digest, within the caller's transaction.
+
+    An upload that can use -- or is about to receive -- these bytes owns the
+    digest now, so an orphan sweep must not delete it. This is deliberately a
+    single DELETE rather than a ``FOR UPDATE`` followed by a delete: the
+    statement has to be a *write*.
+
+    On PostgreSQL a write does the same job either way -- it waits for the
+    sweep's decision lock, and under READ COMMITTED re-judges the WHERE
+    against the row's newest version, so a lease the sweep just marked
+    ``deleted`` matches nothing. On SQLite ``FOR UPDATE`` is ignored
+    entirely, and WAL lets a read transaction watch a committed write happen
+    underneath it; a sweep whose decision only read before unlinking could
+    therefore delete bytes this transaction was attaching. A DELETE is the
+    first statement to touch the database here, so it takes SQLite's writer
+    lock before anything is decided and the two sides truly serialise:
+
+    * this commits first: the candidate is gone, so the sweep's own write
+      claim matches nothing and it walks away;
+    * the sweep commits first: this matches nothing (the row is ``deleted``),
+      and `claim_for_upload` answers from the disk it re-reads afterwards.
+
+    A SQLite connection that already held a stale read snapshot -- an earlier
+    statement in the same request -- can get ``BUSY_SNAPSHOT`` here, which the
+    driver does not retry; that is the same read-to-write upgrade the rest of
+    the write path already accepts on SQLite (see ``Database._configure_sqlite``)
+    and the client repeats the request. The wrong answer is never a deleted
+    file.
+
+    Returns how many candidate rows were removed; callers decide from the
+    disk, not from this number.
+    """
+    result = await session.execute(
+        delete(StorageDeleteLease).where(
+            StorageDeleteLease.digest == md5,
+            StorageDeleteLease.status == LEASE_CANDIDATE,
+        )
+    )
+    return getattr(result, "rowcount", 0) or 0
+
+
+async def claim_for_upload(session: AsyncSession, root: Path, md5: str) -> bool:
+    """Settle a digest between an upload and a pending deletion.
+
+    Returns whether whole bytes for ``md5`` are in the store and ready to be
+    attached without receiving anything. The old code asked the disk this once
+    before doing anything else; that single glance is exactly what the orphan
+    race beat, so a file that is present is re-checked *after* the candidate
+    lease is revoked and the sweep's decision lock has been taken or waited
+    out:
+
+    * present, still present after arbitration: attach and answer
+      ``{"exists": 1}``;
+    * gone in between: a sweep finished deleting it, so fall through to a
+      normal three-request upload instead of attaching a file that is not
+      there -- the client then sends the bytes and registration completes;
+    * never present: any candidate row is stale residue (a process that died
+      between unlink and commit, or a purge converging on a missing file) and
+      is reaped so it cannot stand in front of the new upload.
+
+    The lock wait here can only ever be as long as one decision transaction --
+    one recheck and one unlink -- and is released by commit, rollback or the
+    process dying, so a crashed sweep leaves nothing that blocks an upload.
+    Whatever the outcome, the worst case after waiting is the ordinary one:
+    the client sends bytes that are not stored yet.
+    """
+    present = file_path(root, md5).is_file()
+    await revoke_delete_lease(session, md5)
+    return present and file_path(root, md5).is_file()
+
+
 async def authorize(
     session: AsyncSession,
     library: Library,
@@ -273,9 +356,11 @@ async def authorize(
     """
     _require_attachment(item)
 
-    if file_path(root, declared["md5"]).is_file():
+    if await claim_for_upload(session, root, declared["md5"]):
         # Someone has already uploaded these exact bytes, so only the metadata
-        # needs attaching.
+        # needs attaching. This takes and revokes a deletion lease for the
+        # digest first, which is what keeps the orphan sweep from unlinking
+        # these bytes in the gap between its reference query and its decision.
         await attach(session, item, declared)
         return {"exists": 1}
 
@@ -477,6 +562,14 @@ async def register(
     if upload.item_id != item.id:
         raise InvalidInputError("Upload does not belong to this item")
     await _confirm_stored_file(upload, root)
+
+    # The bytes are confirmed on disk; this upload now owns the digest. Take
+    # the lease off before this same transaction deletes the upload row, so
+    # lock order with the sweep's decision is the same on both sides -- lease
+    # first, upload row second -- rather than one each way, which on
+    # PostgreSQL would be a deadlock. With no candidate here the sweep's
+    # recheck answers on the reference this transaction writes next.
+    await revoke_delete_lease(session, upload.md5)
 
     await attach(
         session,

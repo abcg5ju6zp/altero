@@ -1,8 +1,8 @@
-"""Pending file uploads, and permission to fetch one file back."""
+"""Pending file uploads, permission to fetch one back, and deletion leases."""
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, String, func
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from altero.db import Base
@@ -75,3 +75,59 @@ class StorageDownload(Base):
     #: The digest the redirect promised, in the header the client reads.
     md5: Mapped[str] = mapped_column(String(32))
     expires: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+class StorageDeleteLease(Base):
+    """A reviewable claim that one stored file is heading for deletion.
+
+    The orphan sweep used to read the set of referenced digests and then
+    unlink everything else, so an upload that re-registered a digest in the
+    gap between that read and the unlink had its file deleted straight after
+    the item began referring to it. A lease row closes that gap: the sweep
+    acquires one before a file is touched, and the upload path takes the same
+    row's lock to revoke it, so the two decisions can only happen in a known
+    order. The lifecycle lives in :mod:`altero.services.storagestats`; this
+    table is only the durable arbitration point both sides lock.
+
+    ``candidate`` is the only state that can still delete anything. The row
+    moves to ``deleted`` when the bytes have actually been unlinked -- or is
+    removed outright when an upload revokes it, or the file turns out to be a
+    different incarnation (its size or mtime changed) and must earn a fresh
+    grace period before it can be considered again.
+    """
+
+    __tablename__ = "storage_delete_leases"
+    __table_args__ = (
+        # The decision pass selects mature, non-backing-off candidates.
+        Index("ix_storage_delete_leases_due", "status", "available_at"),
+    )
+
+    #: The file this claim is about, which is also its name in the store.
+    digest: Mapped[str] = mapped_column(String(32), primary_key=True)
+    #: ``candidate`` while deletion is possible, ``deleted`` once it is done.
+    status: Mapped[str] = mapped_column(String(16), default="candidate")
+
+    #: What the file was when the lease was acquired. size and mtime together
+    #: identify the incarnation: `storage.store_file` moves a fresh file onto
+    #: the digest path, so anything uploaded afterwards has a new mtime, even
+    #: though the content-addressed name is the same.
+    size: Mapped[int] = mapped_column(BigInteger)
+    mtime_ns: Mapped[int] = mapped_column(BigInteger)
+
+    #: Not before this may the decision pass run. File mtime plus the grace
+    #: period, so a file that is already older than the grace when first seen
+    #: is decidable in the same sweep that leases it.
+    available_at: Mapped[datetime] = mapped_column(DateTime)
+
+    #: unlink attempts that failed and when the next one may run. A mount that
+    #: refuses to remove a file is recorded as retryable work rather than
+    #: retried on every pass and rather than giving up on the file.
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(255))
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime)
+
+    created: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    #: Set when status moves to deleted; how long the terminal row is kept for
+    #: review is decided by the sweep that prunes it.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime)

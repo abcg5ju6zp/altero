@@ -4,7 +4,7 @@ import asyncio
 import errno
 import hashlib
 import os
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO
 
@@ -13,10 +13,10 @@ import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from altero.models import Library, LibraryType, StorageDownload
-from altero.services import storage
+from altero.models import Library, LibraryType, StorageDeleteLease, StorageDownload
+from altero.services import storage, storagestats
 from altero.services.auth import get_library
-from altero.services.storage import file_path
+from altero.services.storage import LEASE_CANDIDATE, file_path
 from altero.settings import Settings
 from tests.factories import make_api_key, make_item, make_user
 
@@ -938,3 +938,65 @@ class TestRegistrationChecksTheStoredFile:
         assert "md5" not in item.json()["data"]
         # And the library version the failed write took is given back.
         assert item.headers["Last-Modified-Version"] == "10"
+
+
+class TestOrphanPurgeArbitration:
+    """An upload and the orphan sweep deciding about one digest together."""
+
+    async def test_an_upload_re_registering_a_candidate_keeps_its_bytes(
+        self,
+        client: httpx.AsyncClient,
+        session: AsyncSession,
+        attachment: str,
+        settings: Settings,
+    ) -> None:
+        """The race the deletion lease was built to close.
+
+        An old, unreferenced file has already been leased for deletion. The
+        client asks to attach those exact bytes; the server answers
+        ``exists: 1`` and the candidate must be revoked, so the sweep the
+        operator runs afterwards finds nothing to take and the attachment
+        still downloads.
+        """
+        root = Path(settings.storage_path)
+        path = file_path(root, MD5)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(CONTENT)
+        old = datetime.now(UTC).timestamp() - 48 * 3600
+        os.utime(path, (old, old))
+        described = path.stat()
+        session.add(
+            StorageDeleteLease(
+                digest=MD5,
+                status=LEASE_CANDIDATE,
+                size=described.st_size,
+                mtime_ns=described.st_mtime_ns,
+                available_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=24),
+            )
+        )
+        await session.commit()
+
+        response = await client.post(
+            f"/users/1/items/{attachment}/file",
+            headers=AUTH | {"If-None-Match": "*"},
+            data=authorization(),
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"exists": 1}
+        assert path.is_file()
+        # A fresh statement, not the identity map: the request's session is
+        # the one that revoked the row.
+        remaining = await session.scalar(
+            select(StorageDeleteLease).where(StorageDeleteLease.digest == MD5)
+        )
+        assert remaining is None
+
+        files, freed = await storagestats.purge_orphans(session, root, grace=timedelta(hours=24))
+        assert (files, freed) == (0, 0)
+        assert path.is_file()
+        assert (
+            await client.get(
+                f"/users/1/items/{attachment}/file", headers=AUTH, follow_redirects=True
+            )
+        ).content == CONTENT
